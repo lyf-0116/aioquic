@@ -37,6 +37,7 @@ class QuicSentPacket:
     is_crypto_packet: bool
     packet_number: int
     packet_type: QuicPacketType
+    key_phase: int = 0
     sent_time: float | None = None
     sent_bytes: int = 0
 
@@ -275,6 +276,9 @@ class QuicPacketBuilder:
             in_flight=False,
             is_ack_eliciting=False,
             is_crypto_packet=False,
+            key_phase=(
+                crypto.send.key_phase if packet_type == QuicPacketType.ONE_RTT else 0
+            ),
             packet_number=self._packet_number,
             packet_type=packet_type,
         )

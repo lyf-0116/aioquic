@@ -3391,6 +3391,144 @@ class QuicConnectionTimelineTest(QuicConnectionTestCase):
             self.assertSentPackets(client, [0, 0, 0])
             self.assertTrue(client._streams[0].sender.is_finished)
 
+    def test_request_key_update_queued_until_acknowledged(self) -> None:
+        """
+        Check a second key update requested before the current key phase is
+        acknowledged is queued rather than applied, so every 1-RTT packet still
+        uses a key phase the peer can decrypt (RFC 9001 section 6.1).
+        """
+        with client_and_server(handshake=False) as (client, server):
+            self.watch_timers(client, server)
+            now = self.handshake(client, server, now=0.0)
+
+            # Client requests two key updates, then sends stream data. The probe
+            # PING and the stream data share the first packet of the new phase.
+            client.request_key_update()
+            client.request_key_update()
+            client.send_stream_data(0, b"hello")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [37])
+            self.assertEqual(client._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 1)
+            self.assertFalse(client._key_update_allowed)
+
+            # Server receives the stream data and can decrypt it.
+            now = self.advance_by_tick(now)
+            with self.assertPacketsDropped(server, []):
+                server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            self.assertEventsEqual(
+                server,
+                [
+                    events.StreamDataReceived(
+                        data=b"hello", end_stream=False, stream_id=0
+                    )
+                ],
+            )
+            items = server.datagrams_to_send(now=now)
+            self.assertEqual(server._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 1)
+
+            # Client receives the ACK, which confirms the current key phase and
+            # opens the gate. The queued update is applied to the next packet.
+            now = self.advance_by_tick(now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            self.assertTrue(client._key_update_allowed)
+            client.send_stream_data(0, b"world")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(client._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 0)
+
+            # Server receives the second stream data and can decrypt it.
+            now = self.advance_by_tick(now)
+            with self.assertPacketsDropped(server, []):
+                server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            self.assertEventsEqual(
+                server,
+                [
+                    events.StreamDataReceived(
+                        data=b"world", end_stream=False, stream_id=0
+                    )
+                ],
+            )
+
+    def test_request_key_update_idle_sends_probe(self) -> None:
+        """
+        Check a key update requested while the connection is idle still sends an
+        acknowledgment-eliciting packet, so the peer confirms the new key phase
+        and the gate can open even with no application data (RFC 9001
+        section 6.1).
+        """
+        with client_and_server(handshake=False) as (client, server):
+            self.watch_timers(client, server)
+            now = self.handshake(client, server, now=0.0)
+
+            # Client requests a key update while idle, and sends a PING probe.
+            client.request_key_update()
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [29])
+            self.assertEqual(client._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 1)
+
+            # Server receives the probe and follows the key update.
+            now = self.advance_by_tick(now)
+            with self.assertPacketsDropped(server, []):
+                server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            items = server.datagrams_to_send(now=now)
+            self.assertEqual(server._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 1)
+
+            # Client receives the ACK and the gate opens.
+            now = self.advance_by_tick(now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            self.assertTrue(client._key_update_allowed)
+            self.assertEqual(client.datagrams_to_send(now=now), [])
+
+    def test_request_key_update_with_lost_first_packet(self) -> None:
+        """
+        Check the key update gate stays closed while every packet of the current
+        key phase is lost, and opens once a retransmitted packet is
+        acknowledged, so the peer never receives a phase it cannot decrypt
+        (RFC 9001 section 6.1).
+        """
+        with client_and_server(handshake=False) as (client, server):
+            self.watch_timers(client, server)
+            now = self.handshake(client, server, now=0.0)
+
+            # Client requests a key update; the first packet of the new phase is
+            # lost, so the server stays on the previous key phase.
+            client.request_key_update()
+            client.send_stream_data(0, b"first")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(client._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 1)
+            self.assertFalse(client._key_update_allowed)
+
+            # The queued update cannot be applied while the phase is
+            # unacknowledged.
+            client.request_key_update()
+            client.datagrams_to_send(now=now)
+            self.assertEqual(client._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 1)
+
+            # PTO fires and retransmits the data in the same key phase.
+            now = self.advance_to_timer(now, client)
+            client.handle_timer(now=now)
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(client._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 1)
+
+            # Server receives the retransmission and decrypts it.
+            now = self.advance_by_tick(now)
+            with self.assertPacketsDropped(server, []):
+                server.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            self.assertEventsEqual(
+                server,
+                [
+                    events.StreamDataReceived(
+                        data=b"first", end_stream=False, stream_id=0
+                    )
+                ],
+            )
+            items = server.datagrams_to_send(now=now)
+
+            # The ACK confirms the key phase and opens the gate.
+            now = self.advance_by_tick(now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            self.assertTrue(client._key_update_allowed)
+            self.assertEqual(client._cryptos[tls.Epoch.ONE_RTT].send.key_phase, 1)
+
     def watch_timers(self, *connections: QuicConnection) -> None:
         """
         Register the connections whose timers the advance_* helpers check.

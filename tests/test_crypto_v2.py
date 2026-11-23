@@ -346,12 +346,13 @@ class CryptoTest(TestCase):
         self.assertEqual(pair1.key_phase, 0)
         self.assertEqual(pair2.key_phase, 0)
 
-        # pair 1 key - update, but not next to send
+        # pair 1 key update, applied immediately by the explicit phase state
+        # machine; the connection layer is responsible for gating updates.
         pair1.update_key()
 
         # roundtrip
-        send(pair2, pair1, 3)
         send(pair1, pair2, 3)
+        send(pair2, pair1, 3)
         self.assertEqual(pair1.key_phase, 1)
         self.assertEqual(pair2.key_phase, 1)
 

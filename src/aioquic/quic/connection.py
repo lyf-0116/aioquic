@@ -416,7 +416,9 @@ class QuicConnection:
         ]
         self.host_cid = self._host_cids[0].cid
         self._host_cid_seq = 1
-        self._key_update_pending = False
+        self._key_update_allowed = True
+        self._key_update_pending = 0
+        self._key_update_phase_packet_number = 0
         self._local_ack_delay_exponent = 3
         self._local_active_connection_id_limit = 8
         self._local_initial_source_connection_id = self._host_cids[0].cid
@@ -1404,7 +1406,9 @@ class QuicConnection:
         Request an update of the encryption keys.
 
         If the handshake is not confirmed yet, the key update is deferred until
-        it is.
+        it is. A subsequent request made before a packet protected with the
+        updated keys is acknowledged is queued, rather than updating the keys a
+        second time (RFC 9001 section 6.1).
 
         .. aioquic_transmit::
         """
@@ -1412,10 +1416,17 @@ class QuicConnection:
         # confirmed.
         #
         # https://datatracker.ietf.org/doc/html/rfc9001#section-6.1
-        if self._handshake_confirmed:
-            self._cryptos[tls.Epoch.ONE_RTT].update_key()
-        else:
-            self._key_update_pending = True
+        if not self._handshake_confirmed:
+            self._key_update_pending += 1
+            return
+
+        # Queue the request. The update is applied when the next 1-RTT packet is
+        # built, once an acknowledgment confirms the current key phase. Sending an
+        # acknowledgment-eliciting packet makes sure this happens even when the
+        # application has no data to send, so the gate cannot stay closed while
+        # the connection is idle.
+        self._key_update_pending += 1
+        self._send_probe()
 
     def reset_stream(self, stream_id: int, error_code: int) -> None:
         """
@@ -1745,10 +1756,61 @@ class QuicConnection:
         self._loss.handshake_confirmed = True
         self._loss.peer_completed_address_validation = True
 
-        # Start the key update requested before the handshake was confirmed.
-        if self._key_update_pending:
-            self._cryptos[tls.Epoch.ONE_RTT].update_key()
-            self._key_update_pending = False
+        # A key update requested before the handshake was confirmed stays queued
+        # and is applied when the next 1-RTT packet is built.
+
+    def _apply_pending_key_update(self, packet_number: int) -> None:
+        """
+        Apply a queued key update before a 1-RTT packet is built, once the
+        current key phase has been acknowledged.
+
+        The first update after the handshake is always allowed. A subsequent
+        update waits until the lowest unacknowledged packet belongs to the
+        current key phase, so every packet the peer receives can be decrypted
+        (RFC 9001 section 6.1).
+        """
+        if (
+            not self._handshake_confirmed
+            or self._key_update_pending == 0
+            or not self._key_update_allowed
+        ):
+            return
+
+        crypto = self._cryptos[tls.Epoch.ONE_RTT]
+        crypto.update_key()
+        self._key_update_pending -= 1
+        self._key_update_allowed = False
+        # The packet about to be built is the first one protected with the new
+        # key phase.
+        self._key_update_phase_packet_number = packet_number
+
+    def _handle_key_update_ack(self, *, space: QuicPacketSpace) -> None:
+        """
+        Open the key update gate once a packet protected with the current key
+        phase is acknowledged.
+
+        RFC 9001 section 6.1 suggests tracking the lowest packet number sent
+        with the current key phase and the highest acknowledged packet number:
+        once the latter is greater than or equal to the former, another key
+        update is permitted. The key phase recorded on the lowest unacknowledged
+        packet is checked as well, so an acknowledgment covering only older-phase
+        packets cannot open the gate while an older-phase packet is still
+        outstanding.
+        """
+        if self._key_update_allowed:
+            return
+
+        if space.largest_acked_packet < self._key_update_phase_packet_number:
+            return
+
+        # The lowest unacknowledged packet must belong to the current key phase:
+        # packets of an older phase must all have been acknowledged or declared
+        # lost, in which case they are removed from the sent packets.
+        current_phase = self._cryptos[tls.Epoch.ONE_RTT].send.key_phase
+        for packet in space.sent_packets.values():
+            if packet.key_phase != current_phase:
+                return
+        self._key_update_allowed = True
 
     def _connect(self, now: float) -> None:
         """
@@ -2311,6 +2373,12 @@ class QuicConnection:
             now=context.time,
             space=space,
         )
+
+        # An acknowledgment for a packet protected with the current key phase
+        # opens the gate which permits another key update (RFC 9001 section
+        # 6.1).
+        if context.epoch == tls.Epoch.ONE_RTT:
+            self._handle_key_update_ack(space=space)
 
     def _handle_connection_close_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -4090,6 +4158,12 @@ class QuicConnection:
         space = self._spaces[tls.Epoch.ONE_RTT]
 
         while True:
+            # Apply a queued key update before building a packet, so the Key
+            # Phase bit and the keys protecting the packet always come from the
+            # same state (RFC 9001 section 6.1).
+            if packet_type == QuicPacketType.ONE_RTT:
+                self._apply_pending_key_update(builder.packet_number)
+
             # apply pacing, except if we have ACKs to send
             if space.ack_at is None or space.ack_at >= now:
                 self._pacing_at = self._loss._pacer.next_send_time(now=now)
